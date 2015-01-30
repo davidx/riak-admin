@@ -1,0 +1,103 @@
+---
+- name: Creating a security group
+  hosts: local
+  connection: local
+  vars:
+    key_name: aws_basho
+    instance_type: m1.small
+    security_group: riak_cluster_34534
+    image: ami-88562de0
+    region: us-east-1
+    ansible_ssh_user: ubuntu
+
+  tasks:
+    - local_action:
+        module: ec2_group
+        name: "{{ security_group }}"
+        description: Riak food ec2 security group via ansible playbook
+        region: us-east-1
+        rules:
+          - proto: tcp
+            from_port: 80
+            to_port: 80
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            from_port: 22
+            to_port: 22
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            from_port: 8098
+            to_port: 8098
+            cidr_ip: 0.0.0.0/0
+
+    - name: Launch instances
+      ec2:
+         key_name: "{{ key_name }}"
+         group: "{{ security_group }}"
+         instance_type: "{{ instance_type }}"
+         image: "{{ image }}"
+         wait: true
+         region: "{{ region }}"
+         instance_tags:
+           Name: database
+           dbtype: riak
+         exact_count: 5
+         count_tag:
+           Name: database
+           dbtype: riak
+      register: ec2
+    - name: Add new instance to host group
+      add_host: hostname={{ item.public_ip }} groupname=launched
+      with_items: ec2.tagged_instances
+    - name: Wait for SSH to come up
+      wait_for: host={{ item.public_dns_name }} port=22 delay=1 timeout=320 state=started
+      with_items: ec2.tagged_instances
+
+- name: Configure instance(s)
+  hosts: launched
+  sudo: True
+  roles:
+    - { role: basho.riak, tags: ["riak"] }
+
+- hosts: launched[0]
+  sudo: True
+  tasks:
+  - name: collect riak facts
+    riak: command=ping
+    register: riak_outputs
+  - name: debug
+    debug: var=riak_outputs
+
+- hosts: launched:!launched[0]
+  vars:
+     primary_node: "{{ hostvars[ launched[0]]['riak_outputs']['node_name'] }}"
+  sudo: True
+  serial: 1
+  tasks:
+  - name: debug
+    debug: var=hostvars[ansible_hostname][launched[0]]
+  - name: join riak cluster
+    riak: command=join target_node={{ primary_node }}
+
+- hosts: launched[-1]
+  sudo: True
+  serial: 1
+  tasks:
+  - name: wait for nodes to settle
+    pause: seconds=30
+  - name: plan cluster changes
+    riak: command=plan
+    notify:
+    - wait for ring
+    - commit cluster changes
+    - wait for handoffs
+
+  handlers:
+  - name: commit cluster changes
+    riak: command=commit
+
+  - name: wait for handoffs
+    riak: wait_for_handoffs=1200
+
+  - name: wait for ring
+    riak: wait_for_ring=600
